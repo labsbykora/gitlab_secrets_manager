@@ -284,6 +284,31 @@ class GitLabClient:
             json=data)
         return response.json()
     
+    def get_project_info(self) -> Dict[str, Any]:
+        """
+        Get project information including name and ID.
+        
+        Retrieves basic project information from GitLab API.
+        
+        Returns:
+            Dict[str, Any]: Project information including:
+                - id: Project ID
+                - name: Project name
+                - path_with_namespace: Full path with namespace
+                - web_url: Project URL
+        
+        Raises:
+            requests.exceptions.HTTPError: If the API returns an error status code
+            
+        Example:
+            >>> project = client.get_project_info()
+            >>> print(f"Project: {project['name']} (ID: {project['id']})")
+        """
+        # GET /projects/:id
+        response = self._make_request('GET', 
+            f'projects/{self.config.project_id}')
+        return response.json()
+    
     def delete_variable(self, key: str) -> bool:
         """
         Delete a CI/CD variable.
