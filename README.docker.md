@@ -21,6 +21,20 @@ The image is available at:
 - **Image**: `labsbykora/gitlab_secrets_manager`
 - **Tags**: `latest`, `v1.0.0`, or branch names
 
+## Building the Docker Image
+
+If you prefer to build the image locally instead of using the published image:
+
+```bash
+# Build the image
+docker build -t gitlab-secrets-manager:latest .
+
+# Or build with a specific tag
+docker build -t gitlab-secrets-manager:1.0.0 .
+```
+
+After building, replace `ghcr.io/labsbykora/gitlab_secrets_manager:latest` with `gitlab-secrets-manager:latest` in all the examples below.
+
 ## Prerequisites
 
 ### 1. Create Environment File
@@ -761,6 +775,22 @@ docker run --rm \
 6. **Use read-only mounts** - Mount input files as read-only when possible
 7. **Be cautious with `--include-values`** - Only use when necessary
 8. **Clean up downloaded files** - Remove files containing secrets after use
+
+## Dockerfile Options
+
+### Production Dockerfile (`Dockerfile`)
+
+- Minimal size (Python slim image)
+- Non-root user for security
+- Optimized for production use
+
+This is the default Dockerfile used for the published image.
+
+### Development Dockerfile (`Dockerfile.dev`)
+
+- Includes development tools (git, vim, curl)
+- Useful for debugging and development
+- Build with: `docker build -f Dockerfile.dev -t gitlab-secrets-manager:dev .`
 
 ## Image Details
 
