@@ -22,6 +22,7 @@ import click
 import json
 import re
 import yaml
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
 from rich.console import Console
@@ -43,6 +44,99 @@ console = Console(
 
 
 # Variable key validation
+def is_variable_already_exists_error(error: Exception) -> bool:
+    """
+    Check if an error indicates that a variable already exists.
+    
+    GitLab can return different error codes/messages when a variable already exists:
+    - 409 Conflict (standard)
+    - 400 Bad Request with "has already been taken" message
+    
+    Args:
+        error (Exception): The exception raised by requests library
+        
+    Returns:
+        bool: True if the error indicates variable already exists
+    """
+    # Check status code
+    if hasattr(error, 'response') and error.response is not None:
+        status_code = error.response.status_code
+        # 409 Conflict is the standard "already exists" error
+        if status_code == 409:
+            return True
+        
+        # 400 Bad Request can also mean "already exists" in some GitLab versions
+        if status_code == 400:
+            try:
+                error_data = error.response.json()
+                error_message = str(error_data.get('message', '')).lower()
+                # Check for common "already exists" messages
+                if 'already been taken' in error_message or 'already exists' in error_message:
+                    return True
+            except (ValueError, KeyError, AttributeError):
+                pass
+    
+    # Fallback: check error message string
+    error_str = str(error).lower()
+    if '409' in error_str or 'conflict' in error_str:
+        return True
+    if 'already been taken' in error_str or 'already exists' in error_str:
+        return True
+    
+    return False
+
+
+def extract_gitlab_error_message(error: Exception) -> str:
+    """
+    Extract detailed error message from GitLab API error response.
+    
+    GitLab API returns detailed error messages in the response body. This function
+    extracts those messages to provide more helpful error information to users.
+    
+    Args:
+        error (Exception): The exception raised by requests library
+        
+    Returns:
+        str: Detailed error message, or the original error string if extraction fails
+    """
+    # Check if this is an HTTPError with a response
+    if hasattr(error, 'response') and error.response is not None:
+        try:
+            # Try to parse the JSON error response
+            error_data = error.response.json()
+            
+            # GitLab API error format can vary, try common fields
+            if isinstance(error_data, dict):
+                # Common GitLab error formats:
+                # {"message": "error message"}
+                # {"error": "error message"}
+                # {"message": {"key": ["error message"]}}
+                message = error_data.get('message', '')
+                
+                # If message is a dict (field-specific errors), format it nicely
+                if isinstance(message, dict):
+                    error_parts = []
+                    for field, errors in message.items():
+                        if isinstance(errors, list):
+                            error_parts.append(f"{field}: {', '.join(errors)}")
+                        else:
+                            error_parts.append(f"{field}: {errors}")
+                    return '; '.join(error_parts) if error_parts else str(error)
+                
+                # If message is a string, return it
+                if message:
+                    return f"{error.response.status_code} {error.response.reason}: {message}"
+            
+            # Fallback: return status code and reason
+            return f"{error.response.status_code} {error.response.reason}"
+        except (ValueError, KeyError, AttributeError):
+            # If JSON parsing fails, fall back to default error message
+            pass
+    
+    # Fallback to string representation of the error
+    return str(error)
+
+
 def validate_variable_key(key: str) -> bool:
     """
     Validate a GitLab variable key according to GitLab's API rules.
@@ -262,7 +356,9 @@ def create(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
             
             # Create all variables
             console.print(f"[cyan]Creating {len(variables)} variables...[/cyan]")
-            success_count = 0
+            created_count = 0
+            updated_count = 0
+            skipped_count = 0
             failed_count = 0
             
             for var in variables:
@@ -311,34 +407,52 @@ def create(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
                     try:
                         client.create_variable(var_key, var_value, **kwargs)
                         console.print(f"  [green]✓[/green] Created: {var_key}")
-                        success_count += 1
+                        created_count += 1
                     except Exception as create_error:
-                        # If variable already exists and upsert is enabled, try to update
-                        # Check if it's an HTTPError with status code 409 (Conflict)
-                        is_conflict = False
-                        if hasattr(create_error, 'response'):
-                            is_conflict = create_error.response.status_code == 409
-                        else:
-                            # Fallback to string matching for other exception types
-                            is_conflict = '409' in str(create_error) or 'Conflict' in str(create_error)
+                        # Check if variable already exists
+                        is_conflict = is_variable_already_exists_error(create_error)
                         
                         if upsert and is_conflict:
+                            # Update existing variable if upsert is enabled
                             try:
                                 client.update_variable(var_key, var_value, **kwargs)
                                 console.print(f"  [yellow]🔄[/yellow] Updated: {var_key} (already exists)")
-                                success_count += 1
+                                updated_count += 1
                             except Exception as update_error:
-                                console.print(f"  [red]✗[/red] {var_key}: {update_error}")
+                                error_msg = extract_gitlab_error_message(update_error)
+                                console.print(f"  [red]✗[/red] Failed to update {var_key}: {error_msg}")
                                 failed_count += 1
+                        elif is_conflict:
+                            # Variable already exists, but upsert not enabled - skip it
+                            console.print(f"  [dim]⊘[/dim] Skipped: {var_key} (already exists, use --upsert to update)")
+                            skipped_count += 1
                         else:
-                            raise create_error
+                            # Actual error occurred
+                            error_msg = extract_gitlab_error_message(create_error)
+                            console.print(f"  [red]✗[/red] Failed: {var_key} - {error_msg}")
+                            failed_count += 1
                 except Exception as e:
-                    console.print(f"  [red]✗[/red] {var_key}: {e}")
+                    error_msg = extract_gitlab_error_message(e)
+                    console.print(f"  [red]✗[/red] {var_key}: {error_msg}")
                     failed_count += 1
             
-            console.print(f"\n[green]Successfully created: {success_count}[/green]")
+            # Print detailed summary
+            console.print(f"\n[bold]Summary:[/bold]")
+            if created_count > 0:
+                console.print(f"  [green]✓ Created: {created_count}[/green]")
+            if updated_count > 0:
+                console.print(f"  [yellow]🔄 Updated: {updated_count}[/yellow]")
+            if skipped_count > 0:
+                console.print(f"  [dim]⊘ Skipped: {skipped_count} (already exist, use --upsert to update)[/dim]")
             if failed_count > 0:
-                console.print(f"[red]Failed: {failed_count}[/red]")
+                console.print(f"  [red]✗ Failed: {failed_count}[/red]")
+            
+            total_processed = created_count + updated_count + skipped_count + failed_count
+            total_success = created_count + updated_count
+            if total_success > 0:
+                console.print(f"\n[green]Total successful: {total_success} ({created_count} created, {updated_count} updated)[/green]")
+            if total_processed != len(variables):
+                console.print(f"  [yellow]⚠ Total processed: {total_processed} of {len(variables)}[/yellow]")
             
             return
         
@@ -382,20 +496,16 @@ def create(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
             console.print(f"[green]✓[/green] Successfully created variable: [bold]{key}[/bold]")
         except Exception as create_error:
             # If variable already exists and upsert is enabled, try to update
-            # Check if it's an HTTPError with status code 409 (Conflict)
-            is_conflict = False
-            if hasattr(create_error, 'response'):
-                is_conflict = create_error.response.status_code == 409
-            else:
-                # Fallback to string matching for other exception types
-                is_conflict = '409' in str(create_error) or 'Conflict' in str(create_error)
+            is_conflict = is_variable_already_exists_error(create_error)
             
             if upsert and is_conflict:
                 variable = client.update_variable(key, value, **kwargs)
                 is_updated = True
                 console.print(f"[yellow]🔄[/yellow] Successfully updated variable: [bold]{key}[/bold] (already exists)")
             else:
-                raise create_error
+                error_msg = extract_gitlab_error_message(create_error)
+                console.print(f"[red]Error: {error_msg}[/red]")
+                return
         
         # Display variable details in a formatted table
         table = Table(title="Variable Details")
@@ -412,7 +522,8 @@ def create(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
         
     except Exception as e:
         # Display error message if creation fails
-        console.print(f"[red]Error creating variable: {e}[/red]")
+        error_msg = extract_gitlab_error_message(e)
+        console.print(f"[red]Error creating variable: {error_msg}[/red]")
 
 
 @cli.command()
@@ -479,8 +590,9 @@ def read(ctx, key: str):
 @click.option('--raw', type=bool, help='Set raw status (true/false)')
 @click.option('--environment-scope', help='Set environment scope (e.g., production, staging, *)')
 @click.option('--file', '-f', type=click.Path(exists=True), help='Bulk update from file (JSON or .env format)')
+@click.option('--create-if-missing', is_flag=True, help='Create variable if it does not exist (upsert behavior)')
 @click.pass_context
-def update(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, environment_scope: str, file: str):
+def update(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, environment_scope: str, file: str, create_if_missing: bool):
     """
     Update existing GitLab secrets (CI/CD variables).
     
@@ -500,6 +612,10 @@ def update(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
         # Bulk update from file
         python gitlab_secrets.py update --file updates.json
         python gitlab_secrets.py update --file .env.updates
+        
+        # Update or create if missing (upsert)
+        python gitlab_secrets.py update API_KEY "new_value" --create-if-missing
+        python gitlab_secrets.py update --file variables.yaml --create-if-missing
     """
     # Get the GitLab client from context
     client = ctx.obj['client']
@@ -614,11 +730,44 @@ def update(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
                     elif environment_scope:
                         kwargs['environment_scope'] = environment_scope
                     
-                    client.update_variable(var_key, var_value, **kwargs)
-                    console.print(f"  [green]✓[/green] {var_key}")
-                    success_count += 1
+                    # Try to update the variable
+                    try:
+                        client.update_variable(var_key, var_value, **kwargs)
+                        console.print(f"  [green]✓[/green] Updated: {var_key}")
+                        success_count += 1
+                    except Exception as update_error:
+                        # If variable doesn't exist and create-if-missing is enabled, create it
+                        if create_if_missing:
+                            # Check if it's a 404 Not Found error
+                            is_not_found = False
+                            if hasattr(update_error, 'response'):
+                                is_not_found = update_error.response.status_code == 404
+                            else:
+                                is_not_found = '404' in str(update_error) or 'Not Found' in str(update_error)
+                            
+                            if is_not_found:
+                                try:
+                                    # Create the variable with the same parameters
+                                    client.create_variable(var_key, var_value, **kwargs)
+                                    console.print(f"  [yellow]➕[/yellow] Created: {var_key} (did not exist)")
+                                    success_count += 1
+                                except Exception as create_error:
+                                    error_msg = extract_gitlab_error_message(create_error)
+                                    console.print(f"  [red]✗[/red] {var_key}: {error_msg}")
+                                    failed_count += 1
+                            else:
+                                # Some other error occurred during update
+                                error_msg = extract_gitlab_error_message(update_error)
+                                console.print(f"  [red]✗[/red] {var_key}: {error_msg}")
+                                failed_count += 1
+                        else:
+                            # create-if-missing not enabled, show error
+                            error_msg = extract_gitlab_error_message(update_error)
+                            console.print(f"  [red]✗[/red] {var_key}: {error_msg}")
+                            failed_count += 1
                 except Exception as e:
-                    console.print(f"  [red]✗[/red] {var_key}: {e}")
+                    error_msg = extract_gitlab_error_message(e)
+                    console.print(f"  [red]✗[/red] {var_key}: {error_msg}")
                     failed_count += 1
             
             console.print(f"\n[green]Successfully updated: {success_count}[/green]")
@@ -653,14 +802,40 @@ def update(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
         if environment_scope:
             kwargs['environment_scope'] = environment_scope
         
-        # Update the variable via GitLab API
-        variable = client.update_variable(key, value, **kwargs)
+        # Try to update the variable via GitLab API
+        is_created = False
+        try:
+            variable = client.update_variable(key, value, **kwargs)
+            console.print(f"[green]✓[/green] Successfully updated variable: [bold]{key}[/bold]")
+        except Exception as update_error:
+            # If variable doesn't exist and create-if-missing is enabled, create it
+            if create_if_missing:
+                # Check if it's a 404 Not Found error
+                is_not_found = False
+                if hasattr(update_error, 'response'):
+                    is_not_found = update_error.response.status_code == 404
+                else:
+                    is_not_found = '404' in str(update_error) or 'Not Found' in str(update_error)
+                
+                if is_not_found:
+                    # Create the variable with the same parameters
+                    variable = client.create_variable(key, value, **kwargs)
+                    is_created = True
+                    console.print(f"[yellow]➕[/yellow] Successfully created variable: [bold]{key}[/bold] (did not exist)")
+                else:
+                    # Some other error occurred during update
+                    error_msg = extract_gitlab_error_message(update_error)
+                    console.print(f"[red]Error updating variable: {error_msg}[/red]")
+                    return
+            else:
+                # create-if-missing not enabled, show error
+                error_msg = extract_gitlab_error_message(update_error)
+                console.print(f"[red]Error updating variable: {error_msg}[/red]")
+                return
         
-        # Display success message
-        console.print(f"[green]✓[/green] Successfully updated variable: [bold]{key}[/bold]")
-        
-        # Display updated variable details
-        table = Table(title="Updated Variable Details")
+        # Display variable details
+        table_title = "Created Variable Details" if is_created else "Updated Variable Details"
+        table = Table(title=table_title)
         table.add_column("Property", style="cyan")
         table.add_column("Value", style="magenta")
         
@@ -673,8 +848,9 @@ def update(ctx, key: str, value: str, protected: bool, masked: bool, raw: bool, 
         console.print(table)
         
     except Exception as e:
-        # Display error message if update fails
-        console.print(f"[red]Error updating variable: {e}[/red]")
+        # Display error message if update/create fails
+        error_msg = extract_gitlab_error_message(e)
+        console.print(f"[red]Error: {error_msg}[/red]")
 
 
 @cli.command()
@@ -717,6 +893,390 @@ def delete(ctx, key: str):
     except Exception as e:
         # Display error message if deletion fails
         console.print(f"[red]Error deleting variable: {e}[/red]")
+
+
+@cli.command()
+@click.argument('file', type=click.Path(exists=True))
+@click.option('--show-values', is_flag=True, default=False,
+              help='Show variable values in comparison (use with caution for sensitive data)')
+@click.option('--show-properties', is_flag=True, default=False,
+              help='Show protected/masked/raw/environment_scope differences (default: only compares values)')
+@click.option('--only-differences', is_flag=True, default=False,
+              help='Show only variables with differences (hide identical ones)')
+@click.option('--output', '-o', type=click.Path(), help='Export comparison results to file (JSON or YAML)')
+@click.pass_context
+def compare(ctx, file: str, show_values: bool, show_properties: bool, only_differences: bool, output: str):
+    """
+    Compare a local file with GitLab variables.
+    
+    Compares variables in a local file (YAML, JSON, or .env) with variables in GitLab.
+    Shows what's different, missing, or extra. By default, only compares values
+    (properties like protected/masked/raw are ignored unless --show-properties is used).
+    
+    Args:
+        file: Path to the local file to compare
+    
+    Example:
+        gitlab-secrets compare variables.yaml
+        gitlab-secrets compare staging-values.yaml --show-values
+        gitlab-secrets compare .env.production --show-properties
+        gitlab-secrets compare variables.yaml --only-differences --output diff.json
+    """
+    # Get the GitLab client from context
+    client = ctx.obj['client']
+    
+    try:
+        # Parse local file
+        file_path = Path(file)
+        local_variables = {}
+        
+        console.print(f"[cyan]Reading local file: {file_path}[/cyan]")
+        
+        if file_path.suffix in ['.yml', '.yaml']:
+            # Read YAML file
+            with open(file_path, 'r') as f:
+                data = yaml.safe_load(f)
+            
+            # Handle different YAML structures
+            if isinstance(data, dict):
+                if 'variables' in data:
+                    # Structured format
+                    for var in data['variables']:
+                        key = var.get('key', '')
+                        if key:
+                            local_variables[key] = {
+                                'value': var.get('value', ''),
+                                'protected': var.get('protected', False),
+                                'masked': var.get('masked', False),
+                                'raw': var.get('raw', False),
+                                'environment_scope': var.get('environment_scope', '*')
+                            }
+                else:
+                    # Simple key-value format
+                    for key, value in data.items():
+                        if key and not key.startswith('#'):
+                            local_variables[key] = {
+                                'value': value if isinstance(value, str) else str(value),
+                                'protected': False,
+                                'masked': False,
+                                'raw': False,
+                                'environment_scope': '*'
+                            }
+            elif isinstance(data, list):
+                for var in data:
+                    key = var.get('key', '')
+                    if key:
+                        local_variables[key] = {
+                            'value': var.get('value', ''),
+                            'protected': var.get('protected', False),
+                            'masked': var.get('masked', False),
+                            'raw': var.get('raw', False),
+                            'environment_scope': var.get('environment_scope', '*')
+                        }
+        
+        elif file_path.suffix == '.json':
+            # Read JSON file
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            
+            # Handle different JSON structures
+            if isinstance(data, dict):
+                if 'variables' in data:
+                    for var in data['variables']:
+                        key = var.get('key', '')
+                        if key:
+                            local_variables[key] = {
+                                'value': var.get('value', ''),
+                                'protected': var.get('protected', False),
+                                'masked': var.get('masked', False),
+                                'raw': var.get('raw', False),
+                                'environment_scope': var.get('environment_scope', '*')
+                            }
+                else:
+                    # Simple key-value format
+                    for key, value in data.items():
+                        if key and not key.startswith('#'):
+                            local_variables[key] = {
+                                'value': value if isinstance(value, str) else str(value),
+                                'protected': False,
+                                'masked': False,
+                                'raw': False,
+                                'environment_scope': '*'
+                            }
+            elif isinstance(data, list):
+                for var in data:
+                    key = var.get('key', '')
+                    if key:
+                        local_variables[key] = {
+                            'value': var.get('value', ''),
+                            'protected': var.get('protected', False),
+                            'masked': var.get('masked', False),
+                            'raw': var.get('raw', False),
+                            'environment_scope': var.get('environment_scope', '*')
+                        }
+        
+        elif file_path.suffix == '.env' or 'env' in file_path.name:
+            # Read .env file
+            with open(file_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        if key:
+                            local_variables[key] = {
+                                'value': value,
+                                'protected': False,
+                                'masked': False,
+                                'raw': False,
+                                'environment_scope': '*'
+                            }
+        else:
+            console.print("[red]Unsupported file format. Use .yaml, .json, or .env files[/red]")
+            return
+        
+        if not local_variables:
+            console.print("[yellow]No variables found in local file[/yellow]")
+            return
+        
+        console.print(f"[green]Found {len(local_variables)} variables in local file[/green]")
+        
+        # Fetch GitLab variables
+        console.print(f"[cyan]Fetching variables from GitLab...[/cyan]")
+        gitlab_variables = client.list_variables()
+        gitlab_dict = {}
+        for var in gitlab_variables:
+            key = var.get('key', '')
+            if key:
+                gitlab_dict[key] = {
+                    'value': var.get('value', ''),
+                    'protected': var.get('protected', False),
+                    'masked': var.get('masked', False),
+                    'raw': var.get('raw', False),
+                    'environment_scope': var.get('environment_scope', '*')
+                }
+        
+        console.print(f"[green]Found {len(gitlab_dict)} variables in GitLab[/green]\n")
+        
+        # Compare
+        only_in_local = []
+        only_in_gitlab = []
+        different = []
+        same = []
+        
+        # Check variables in local file
+        for key, local_var in local_variables.items():
+            if key not in gitlab_dict:
+                only_in_local.append(key)
+            else:
+                gitlab_var = gitlab_dict[key]
+                # Compare values and properties
+                value_diff = local_var['value'] != gitlab_var['value']
+                props_diff = False
+                if show_properties:
+                    props_diff = (
+                        local_var['protected'] != gitlab_var['protected'] or
+                        local_var['masked'] != gitlab_var['masked'] or
+                        local_var['raw'] != gitlab_var['raw'] or
+                        local_var['environment_scope'] != gitlab_var['environment_scope']
+                    )
+                
+                if value_diff or props_diff:
+                    differences = []
+                    if value_diff:
+                        differences.append('value')
+                    if props_diff:
+                        prop_diffs = []
+                        if local_var['protected'] != gitlab_var['protected']:
+                            prop_diffs.append('protected')
+                        if local_var['masked'] != gitlab_var['masked']:
+                            prop_diffs.append('masked')
+                        if local_var['raw'] != gitlab_var['raw']:
+                            prop_diffs.append('raw')
+                        if local_var['environment_scope'] != gitlab_var['environment_scope']:
+                            prop_diffs.append('environment_scope')
+                        differences.append(f"properties ({', '.join(prop_diffs)})")
+                    
+                    # Prepare export data - only include properties if show_properties is enabled
+                    export_local = {'value': local_var['value']}
+                    export_gitlab = {'value': gitlab_var['value']}
+                    
+                    if show_properties:
+                        # Include all properties when show_properties is enabled
+                        export_local.update({
+                            'protected': local_var['protected'],
+                            'masked': local_var['masked'],
+                            'raw': local_var['raw'],
+                            'environment_scope': local_var['environment_scope']
+                        })
+                        export_gitlab.update({
+                            'protected': gitlab_var['protected'],
+                            'masked': gitlab_var['masked'],
+                            'raw': gitlab_var['raw'],
+                            'environment_scope': gitlab_var['environment_scope']
+                        })
+                    # When show_properties is False, only values are included (default behavior)
+                    
+                    different.append({
+                        'key': key,
+                        'local': local_var,  # Keep full data for display
+                        'gitlab': gitlab_var,  # Keep full data for display
+                        'differences': differences,
+                        'export_local': export_local,  # Filtered data for export (only values, or values + properties if show_properties)
+                        'export_gitlab': export_gitlab  # Filtered data for export (only values, or values + properties if show_properties)
+                    })
+                else:
+                    same.append(key)
+        
+        # Check variables only in GitLab
+        for key in gitlab_dict:
+            if key not in local_variables:
+                only_in_gitlab.append(key)
+        
+        # Prepare data for export
+        export_data = {
+            'comparison': {
+                'local_file': str(file_path),
+                'timestamp': datetime.now().isoformat(),
+                'summary': {
+                    'identical': len(same),
+                    'only_in_local': len(only_in_local),
+                    'only_in_gitlab': len(only_in_gitlab),
+                    'different': len(different),
+                    'total_local': len(local_variables),
+                    'total_gitlab': len(gitlab_dict)
+                },
+                'only_in_local': sorted(only_in_local),
+                'only_in_gitlab': sorted(only_in_gitlab),
+                'different': [
+                    {
+                        'key': d['key'],
+                        'differences': d['differences'],
+                        'local': d.get('export_local', d['local']),
+                        'gitlab': d.get('export_gitlab', d['gitlab'])
+                    }
+                    for d in different
+                ],
+                'identical': sorted(same) if not only_differences else []
+            }
+        }
+        
+        # Display results
+        console.print(f"[bold]Comparison Results:[/bold]\n")
+        
+        # Variables only in local file
+        if only_in_local:
+            console.print(f"[yellow]📝 Variables only in local file ({len(only_in_local)}):[/yellow]")
+            for key in sorted(only_in_local):
+                console.print(f"  • {key}")
+            console.print()
+        
+        # Variables only in GitLab
+        if only_in_gitlab:
+            console.print(f"[cyan]☁️  Variables only in GitLab ({len(only_in_gitlab)}):[/cyan]")
+            for key in sorted(only_in_gitlab):
+                console.print(f"  • {key}")
+            console.print()
+        
+        # Variables with differences - show side-by-side diff format
+        if different:
+            console.print(f"[red]⚠️  Variables with differences ({len(different)}):[/red]\n")
+            for diff in different:
+                console.print(f"  [bold]{diff['key']}[/bold]")
+                console.print(f"    Differences: {', '.join(diff['differences'])}")
+                
+                # Side-by-side comparison for values
+                if show_values and diff['local']['value'] != diff['gitlab']['value']:
+                    local_val = diff['local']['value']
+                    gitlab_val = diff['gitlab']['value']
+                    
+                    # Create a simple diff view
+                    console.print(f"\n    [dim]Value Comparison:[/dim]")
+                    # Show side-by-side if values are short enough, otherwise show separately
+                    max_width = 50
+                    if len(local_val) <= max_width and len(gitlab_val) <= max_width:
+                        # Side-by-side format
+                        console.print(f"    [green]Local:[/green]  {local_val}")
+                        console.print(f"    [cyan]GitLab:[/cyan] {gitlab_val}")
+                    else:
+                        # Truncated format for long values
+                        local_display = local_val[:100] + ('...' if len(local_val) > 100 else '')
+                        gitlab_display = gitlab_val[:100] + ('...' if len(gitlab_val) > 100 else '')
+                        console.print(f"    [green]Local:[/green]  {local_display}")
+                        console.print(f"    [cyan]GitLab:[/cyan] {gitlab_display}")
+                
+                # Show property differences if requested
+                if show_properties:
+                    props = []
+                    if diff['local']['protected'] != diff['gitlab']['protected']:
+                        props.append(f"protected: {diff['local']['protected']} → {diff['gitlab']['protected']}")
+                    if diff['local']['masked'] != diff['gitlab']['masked']:
+                        props.append(f"masked: {diff['local']['masked']} → {diff['gitlab']['masked']}")
+                    if diff['local']['raw'] != diff['gitlab']['raw']:
+                        props.append(f"raw: {diff['local']['raw']} → {diff['gitlab']['raw']}")
+                    if diff['local']['environment_scope'] != diff['gitlab']['environment_scope']:
+                        props.append(f"environment_scope: {diff['local']['environment_scope']} → {diff['gitlab']['environment_scope']}")
+                    if props:
+                        console.print(f"    [dim]Properties:[/dim]")
+                        for prop in props:
+                            console.print(f"      {prop}")
+                console.print()
+        
+        # Variables that are the same (only show if not filtering)
+        if same and not only_differences:
+            console.print(f"[green]✓ Variables identical ({len(same)}):[/green]")
+            if len(same) <= 20:
+                for key in sorted(same):
+                    console.print(f"  • {key}")
+            else:
+                console.print(f"  (showing first 20 of {len(same)})")
+                for key in sorted(same)[:20]:
+                    console.print(f"  • {key}")
+            console.print()
+        
+        # Summary
+        console.print(f"[bold]Summary:[/bold]")
+        console.print(f"  [green]✓ Identical: {len(same)}[/green]")
+        if only_in_local:
+            console.print(f"  [yellow]📝 Only in local: {len(only_in_local)}[/yellow]")
+        if only_in_gitlab:
+            console.print(f"  [cyan]☁️  Only in GitLab: {len(only_in_gitlab)}[/cyan]")
+        if different:
+            console.print(f"  [red]⚠️  Different: {len(different)}[/red]")
+        
+        total_local = len(local_variables)
+        total_gitlab = len(gitlab_dict)
+        console.print(f"\n  Total in local file: {total_local}")
+        console.print(f"  Total in GitLab: {total_gitlab}")
+        
+        # Export to file if requested
+        if output:
+            output_path = Path(output)
+            file_ext = output_path.suffix.lower()
+            
+            try:
+                if file_ext in ['.yml', '.yaml']:
+                    with open(output_path, 'w') as f:
+                        yaml.dump(export_data, f, default_flow_style=False, sort_keys=False, indent=2)
+                    console.print(f"\n[green]✓[/green] Comparison results exported to [bold]{output_path}[/bold]")
+                elif file_ext == '.json':
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        json.dump(export_data, f, indent=2, ensure_ascii=False)
+                    console.print(f"\n[green]✓[/green] Comparison results exported to [bold]{output_path}[/bold]")
+                else:
+                    # Default to JSON if no extension
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        json.dump(export_data, f, indent=2, ensure_ascii=False)
+                    console.print(f"\n[green]✓[/green] Comparison results exported to [bold]{output_path}[/bold] (JSON format)")
+            except Exception as export_error:
+                console.print(f"\n[red]Error exporting results: {export_error}[/red]")
+        
+    except Exception as e:
+        error_msg = extract_gitlab_error_message(e)
+        console.print(f"[red]Error comparing files: {error_msg}[/red]")
 
 
 @cli.command('list')
@@ -872,6 +1432,31 @@ def download(ctx, output: str, format: str, sort: str, reverse: bool, include_va
     client = ctx.obj['client']
     
     try:
+        # Fetch project information for metadata
+        try:
+            project_info = client.get_project_info()
+            project_name = project_info.get('name', 'Unknown')
+            project_id = project_info.get('id', client.config.project_id)
+            project_path = project_info.get('path_with_namespace', 'Unknown')
+            project_url = project_info.get('web_url', '')
+        except Exception:
+            # If we can't fetch project info, use defaults
+            project_name = 'Unknown'
+            project_id = client.config.project_id
+            project_path = 'Unknown'
+            project_url = ''
+        
+        # Get download date
+        from datetime import datetime
+        download_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        download_date_iso = datetime.now().isoformat()
+        
+        # Get GitLab instance URL
+        gitlab_url = client.config.gitlab_url
+        
+        # Tool version
+        tool_version = "1.0.0"
+        
         # Fetch all variables from GitLab
         variables = client.list_variables()
         
@@ -879,6 +1464,17 @@ def download(ctx, output: str, format: str, sort: str, reverse: bool, include_va
         if not variables:
             console.print("[yellow]No variables found[/yellow]")
             return
+        
+        # Calculate variable statistics
+        protected_count = sum(1 for var in variables if var.get('protected', False))
+        masked_count = sum(1 for var in variables if var.get('masked', False))
+        raw_count = sum(1 for var in variables if var.get('raw', False))
+        
+        # Get unique environment scopes
+        environment_scopes = sorted(set(var.get('environment_scope', '*') for var in variables))
+        env_scope_summary = ', '.join(environment_scopes[:5])  # Show first 5
+        if len(environment_scopes) > 5:
+            env_scope_summary += f" (+{len(environment_scopes) - 5} more)"
         
         # Apply filter if provided
         if filter:
@@ -940,7 +1536,20 @@ def download(ctx, output: str, format: str, sort: str, reverse: bool, include_va
                 # Write simple YAML format
                 with open(output_path, 'w') as f:
                     f.write("# GitLab CI/CD Variables\n")
-                    f.write(f"# Total: {len(variables)}\n")
+                    f.write(f"# Project: {project_name}\n")
+                    f.write(f"# Project Path: {project_path}\n")
+                    f.write(f"# Project ID: {project_id}\n")
+                    if project_url:
+                        f.write(f"# Project URL: {project_url}\n")
+                    f.write(f"# GitLab Instance: {gitlab_url}\n")
+                    f.write(f"# Downloaded: {download_date}\n")
+                    f.write(f"# Tool Version: {tool_version}\n")
+                    f.write(f"# Total Variables: {len(variables)}\n")
+                    if filter:
+                        f.write(f"# Filter Applied: {filter}\n")
+                    f.write(f"# Statistics: {protected_count} protected, {masked_count} masked, {raw_count} raw\n")
+                    if len(environment_scopes) > 1 or (len(environment_scopes) == 1 and environment_scopes[0] != '*'):
+                        f.write(f"# Environment Scopes: {env_scope_summary}\n")
                     f.write(f"# Sorted by: {sort}\n\n")
                     yaml.dump(simple_data, f, default_flow_style=False, sort_keys=False)
                 
@@ -966,6 +1575,22 @@ def download(ctx, output: str, format: str, sort: str, reverse: bool, include_va
                 
                 # Write structured YAML to file with indentation for readability
                 with open(output_path, 'w') as f:
+                    f.write("# GitLab CI/CD Variables\n")
+                    f.write(f"# Project: {project_name}\n")
+                    f.write(f"# Project Path: {project_path}\n")
+                    f.write(f"# Project ID: {project_id}\n")
+                    if project_url:
+                        f.write(f"# Project URL: {project_url}\n")
+                    f.write(f"# GitLab Instance: {gitlab_url}\n")
+                    f.write(f"# Downloaded: {download_date}\n")
+                    f.write(f"# Tool Version: {tool_version}\n")
+                    f.write(f"# Total Variables: {len(variables)}\n")
+                    if filter:
+                        f.write(f"# Filter Applied: {filter}\n")
+                    f.write(f"# Statistics: {protected_count} protected, {masked_count} masked, {raw_count} raw\n")
+                    if len(environment_scopes) > 1 or (len(environment_scopes) == 1 and environment_scopes[0] != '*'):
+                        f.write(f"# Environment Scopes: {env_scope_summary}\n")
+                    f.write(f"# Sorted by: {sort}\n\n")
                     yaml.dump(data, f, default_flow_style=False, sort_keys=False, indent=2)
             
             console.print(f"[green]✓[/green] Downloaded {len(variables)} variables to [bold]{output_path}[/bold]")
@@ -989,6 +1614,28 @@ def download(ctx, output: str, format: str, sort: str, reverse: bool, include_va
                     'total': len(variables),
                     'sorted_by': sort
                 }
+            
+            # Add project metadata to JSON data
+            data['project'] = {
+                'name': project_name,
+                'path': project_path,
+                'id': project_id
+            }
+            if project_url:
+                data['project']['url'] = project_url
+            data['gitlab_instance'] = gitlab_url
+            data['downloaded'] = download_date
+            data['downloaded_iso'] = download_date_iso
+            data['tool_version'] = tool_version
+            if filter:
+                data['filter_applied'] = filter
+            data['statistics'] = {
+                'total': len(variables),
+                'protected': protected_count,
+                'masked': masked_count,
+                'raw': raw_count
+            }
+            data['environment_scopes'] = environment_scopes
             
             # Write standard JSON format (valid JSON with escaped newlines)
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -1027,7 +1674,20 @@ def download(ctx, output: str, format: str, sort: str, reverse: bool, include_va
             with open(output_path, 'w') as f:
                 # Write header comments
                 f.write(f"# GitLab CI/CD Variables\n")
-                f.write(f"# Total: {len(variables)}\n")
+                f.write(f"# Project: {project_name}\n")
+                f.write(f"# Project Path: {project_path}\n")
+                f.write(f"# Project ID: {project_id}\n")
+                if project_url:
+                    f.write(f"# Project URL: {project_url}\n")
+                f.write(f"# GitLab Instance: {gitlab_url}\n")
+                f.write(f"# Downloaded: {download_date}\n")
+                f.write(f"# Tool Version: {tool_version}\n")
+                f.write(f"# Total Variables: {len(variables)}\n")
+                if filter:
+                    f.write(f"# Filter Applied: {filter}\n")
+                f.write(f"# Statistics: {protected_count} protected, {masked_count} masked, {raw_count} raw\n")
+                if len(environment_scopes) > 1 or (len(environment_scopes) == 1 and environment_scopes[0] != '*'):
+                    f.write(f"# Environment Scopes: {env_scope_summary}\n")
                 f.write(f"# Sorted by: {sort}\n\n")
                 
                 # Write each variable as key=value

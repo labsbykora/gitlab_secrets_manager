@@ -39,11 +39,12 @@ ENV/
 
 # Sensitive/Output files
 secrets.json
-secrets.yml
-secrets.yaml
+*secrets.yml
+*secrets.yaml
 newvars.*
 longvars.*
 my-values.*
+*values.yaml
 *newvars*
 output/
 
